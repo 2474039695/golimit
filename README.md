@@ -20,8 +20,8 @@ package main
 import (
     "github.com/gin-gonic/gin"
     "github.com/go-redis/redis/v9"
-    "github.com/yourname/golimit/limiter"
-    "github.com/yourname/golimit/middleware"
+    "github.com/2474039695/golimit/limiter"
+    "github.com/2474039695/golimit/middleware"
 )
 
 func main() {
