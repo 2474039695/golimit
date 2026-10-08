@@ -7,8 +7,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// New returns a Gin middleware handler.
-func New(key string, l limiter.Limiter) gin.HandlerFunc {
+// NewGin returns a Gin middleware handler.
+func NewGin(key string, l limiter.Limiter) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		allowed, err := l.Allow(c.Request.Context(), key, 1)
 		if err != nil {
@@ -27,4 +27,11 @@ func New(key string, l limiter.Limiter) gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+// New 是 NewGin 的兼容入口。
+//
+// Deprecated: 请使用 NewGin。
+func New(key string, l limiter.Limiter) gin.HandlerFunc {
+	return NewGin(key, l)
 }

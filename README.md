@@ -2,10 +2,14 @@
 
 一个基于 Redis + Lua 的高性能分布式限流组件，当前同时支持 `Gin`、`GoFrame` 和 Prometheus 指标暴露。
 
+限流器和框架中间件使用明确的命名：`limiter.NewRedis` 创建 Redis 限流器，`middleware.NewGin` 和 `middleware.NewGoFrame` 分别创建 Gin、GoFrame 中间件。旧的 `limiter.New` 和 `middleware.New` 仍可使用，但已标记为弃用。
+
 ## 特性
 
 - 基于 Redis Lua 脚本，保证限流判断的原子性。
 - 使用令牌桶算法，支持突发流量。
+- 保留不足一个令牌的补充时间，持续高频请求也不会阻止令牌恢复；达到桶容量时清除多余积累。
+- Redis 桶的过期时间至少覆盖完整补充周期，避免低速率桶在恢复前被重置。
 - 核心限流逻辑与 Web 框架解耦，便于扩展不同适配层。
 - 限流组件异常时默认 fail-open，不阻塞业务请求。
 - 支持 Prometheus 指标，可监控放行数、拒绝数、错误数、令牌消耗和限流耗时。
@@ -33,13 +37,13 @@ func main() {
 		Addr: "localhost:6379",
 	})
 
-	l := limiter.New(rdb, limiter.Config{
+	l := limiter.NewRedis(rdb, limiter.Config{
 		Rate:     10,
 		Capacity: 20,
 	})
 
 	r := gin.Default()
-	r.Use(middleware.New("login_api", l))
+	r.Use(middleware.NewGin("login_api", l))
 
 	r.GET("/ping", func(c *gin.Context) {
 		c.JSON(200, gin.H{"message": "pong"})
@@ -67,7 +71,7 @@ func main() {
 		Addr: "localhost:6379",
 	})
 
-	l := limiter.New(rdb, limiter.Config{
+	l := limiter.NewRedis(rdb, limiter.Config{
 		Rate:     10,
 		Capacity: 20,
 	})
@@ -107,12 +111,12 @@ func main() {
 		Capacity: 20,
 	}
 
-	baseLimiter := limiter.New(rdb, cfg)
+	baseLimiter := limiter.NewRedis(rdb, cfg)
 	metricLimiter := metrics.WrapPrometheus(baseLimiter, cfg, metrics.Options{})
 
 	r := gin.Default()
 	r.GET("/metrics", gin.WrapH(metrics.Handler()))
-	r.Use(middleware.New("login_api", metricLimiter))
+	r.Use(middleware.NewGin("login_api", metricLimiter))
 
 	r.GET("/ping", func(c *gin.Context) {
 		c.JSON(200, gin.H{"message": "pong"})
@@ -146,7 +150,7 @@ func main() {
 		Capacity: 20,
 	}
 
-	baseLimiter := limiter.New(rdb, cfg)
+	baseLimiter := limiter.NewRedis(rdb, cfg)
 	metricLimiter := metrics.WrapPrometheus(baseLimiter, cfg, metrics.Options{})
 
 	s := g.Server()

@@ -18,8 +18,8 @@ type RedisLimiter struct {
 	cfg    Config
 }
 
-// New 创建一个新的分布式限流器
-func New(client redis.UniversalClient, cfg Config) *RedisLimiter {
+// NewRedis 创建一个基于 Redis 的分布式限流器。
+func NewRedis(client redis.UniversalClient, cfg Config) *RedisLimiter {
 	// 设置默认值
 	if cfg.KeyPrefix == "" {
 		cfg.KeyPrefix = "golimit"
@@ -33,6 +33,13 @@ func New(client redis.UniversalClient, cfg Config) *RedisLimiter {
 		script: redis.NewScript(luaScript),
 		cfg:    cfg,
 	}
+}
+
+// New 是 NewRedis 的兼容入口。
+//
+// Deprecated: 请使用 NewRedis。
+func New(client redis.UniversalClient, cfg Config) *RedisLimiter {
+	return NewRedis(client, cfg)
 }
 
 // Allow 检查是否允许请求通过
