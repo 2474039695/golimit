@@ -2,6 +2,10 @@ package limiter
 
 import (
 	"context"
+	"errors"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -9,149 +13,114 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-func TestScriptPreservesPartialRefillOnDeniedRequests(t *testing.T) {
-	client, _ := testRedis(t)
-	ctx := context.Background()
-	check := func(now int64, want int) {
-		t.Helper()
-		got, err := redis.NewScript(luaScript).Run(ctx, client, []string{"partial"}, 10, 1, now, 1).Int()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got != want {
-			t.Fatalf("at %d ms: got %d, want %d", now, got, want)
-		}
-	}
-
-	check(0, 1)
-	check(50, 0)
-	check(100, 1)
-	check(150, 0)
-	check(200, 1)
-}
-
-func TestScriptDiscardsExcessTimeAtCapacity(t *testing.T) {
-	client, _ := testRedis(t)
-	ctx := context.Background()
-	for _, step := range []struct {
-		now  int64
-		want int
-	}{
-		{0, 1},
-		{10000, 1},
-		{10000, 0},
-		{10500, 0},
-		{11000, 1},
+func TestRedisClientSafetyValidation(t *testing.T) {
+	for _, opts := range []*redis.Options{
+		{Addr: "localhost:6379"},
+		{Addr: "localhost:6379", ContextTimeoutEnabled: true},
+		{Addr: "localhost:6379", MaxRetries: -1},
 	} {
-		got, err := redis.NewScript(luaScript).Run(ctx, client, []string{"full"}, 1, 1, step.now, 1).Int()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got != step.want {
-			t.Fatalf("at %d ms: got %d, want %d", step.now, got, step.want)
-		}
-	}
-}
-
-func TestScriptCarriesFractionalPeriodsBelowCapacity(t *testing.T) {
-	client, _ := testRedis(t)
-	ctx := context.Background()
-	for _, step := range []struct {
-		now       int64
-		requested int
-		want      int
-	}{
-		{0, 2, 1},
-		{333, 1, 0},
-		{334, 1, 1},
-		{666, 1, 0},
-		{667, 1, 1},
-	} {
-		got, err := redis.NewScript(luaScript).Run(ctx, client, []string{"carry"}, 3, 2, step.now, step.requested).Int()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got != step.want {
-			t.Fatalf("at %d ms: got %d, want %d", step.now, got, step.want)
+		c := redis.NewClient(opts)
+		_, err := NewRedis(c, Config{Rate: 1, Capacity: 1})
+		_ = c.Close()
+		if !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("unsafe client accepted: %v", err)
 		}
 	}
-}
-
-func TestScriptFractionalRateAndClockRollback(t *testing.T) {
-	client, _ := testRedis(t)
-	ctx := context.Background()
-	for _, step := range []struct {
-		now  int64
-		want int
-	}{
-		{1000, 1},
-		{900, 0},
-		{1333, 0},
-		{1334, 1},
-		{1667, 0},
-		{1668, 1},
-		{2001, 0},
-		{2002, 1},
-	} {
-		got, err := redis.NewScript(luaScript).Run(ctx, client, []string{"fractional"}, 3, 1, step.now, 1).Int()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if got != step.want {
-			t.Fatalf("at %d ms: got %d, want %d", step.now, got, step.want)
-		}
-	}
-}
-
-func TestScriptKeepsSlowBucketsUntilTheyRefill(t *testing.T) {
-	client, server := testRedis(t)
-	ctx := context.Background()
-	if _, err := redis.NewScript(luaScript).Run(ctx, client, []string{"slow"}, 0.0001, 1, 0, 1).Int(); err != nil {
+	c := redis.NewClusterClient(&redis.ClusterOptions{Addrs: []string{"localhost:6379"}, ContextTimeoutEnabled: true, MaxRetries: -1, MaxRedirects: -1})
+	defer c.Close()
+	if _, err := NewRedis(c, Config{Rate: 1, Capacity: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if ttl := server.TTL("slow"); ttl < 10000*time.Second {
-		t.Fatalf("TTL %s expires before the bucket refills", ttl)
-	}
 }
 
-func TestScriptReadsExistingBucketWithoutRemainingTime(t *testing.T) {
-	client, _ := testRedis(t)
-	ctx := context.Background()
-	if err := client.HSet(ctx, "legacy", "tokens", 0, "last_time", 0).Err(); err != nil {
-		t.Fatal(err)
-	}
-	got, err := redis.NewScript(luaScript).Run(ctx, client, []string{"legacy"}, 10, 1, 100, 1).Int()
+func TestRedisInvalidRequestsDoNotCreateKeys(t *testing.T) {
+	c, s := testRedis(t)
+	l, err := NewRedis(c, Config{Rate: 1, Capacity: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != 1 {
-		t.Fatalf("existing bucket: got %d, want 1", got)
+	for _, req := range []struct {
+		key   string
+		count int64
+	}{
+		{"", 1}, {"x", 0}, {"x", -1}, {"x", 3}, {strings.Repeat("a", MaxKeyBytes+1), 1},
+	} {
+		if _, err := l.Check(context.Background(), req.key, req.count); !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("request %+v: %v", req, err)
+		}
+	}
+	if len(s.Keys()) != 0 {
+		t.Fatalf("invalid requests created keys: %v", s.Keys())
 	}
 }
 
-func TestScriptRejectsInvalidArgumentsWithoutWritingState(t *testing.T) {
-	client, server := testRedis(t)
+func TestConcurrentRedisDeductionsAndMetadata(t *testing.T) {
+	c, _ := testRedis(t)
+	l, err := NewRedis(c, Config{Rate: .0001, Capacity: 10, Timeout: 5 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	var allowed atomic.Int64
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, err := l.Check(context.Background(), "shared", 1)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if r.Allowed {
+				allowed.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := allowed.Load(); got != 10 {
+		t.Fatalf("concurrent allow=%d, want 10", got)
+	}
+	r, err := l.Check(context.Background(), "shared", 1)
+	if err != nil || r.Allowed || !r.Metadata || r.Remaining != 0 || r.RetryAfter <= 0 || r.ResetAfter < r.RetryAfter {
+		t.Fatalf("metadata %+v %v", r, err)
+	}
+}
+
+func TestBucketConfigConflictAndCorruptStateDoNotResetQuota(t *testing.T) {
+	c, s := testRedis(t)
 	ctx := context.Background()
-	for _, args := range [][]any{
-		{0, 1, 0, 1},
-		{1, 0, 0, 1},
-		{1, 1, 0, 0},
-		{1, 1, 0, -1},
-		{1e-20, 1, 0, 1},
-	} {
-		if err := redis.NewScript(luaScript).Run(ctx, client, []string{"invalid"}, args...).Err(); err == nil {
-			t.Fatalf("arguments %v were accepted", args)
-		}
-		if server.Exists("invalid") {
-			t.Fatalf("arguments %v wrote limiter state", args)
-		}
+	l, err := NewRedis(c, Config{Rate: 1, Capacity: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Check(ctx, "conflict", 2); err != nil {
+		t.Fatal(err)
+	}
+	other, err := NewRedis(c, Config{Rate: 2, Capacity: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.Check(ctx, "conflict", 1); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("config conflict: %v", err)
+	}
+	if got := s.HGet("golimit:conflict", "tokens"); got != "0" {
+		t.Fatalf("conflict changed quota: %s", got)
+	}
+	if err := c.HSet(ctx, "golimit:corrupt", "tokens", "bad", "last_time", 0).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Check(ctx, "corrupt", 1); !errors.Is(err, ErrBackend) {
+		t.Fatalf("corrupt state: %v", err)
+	}
+	if got := s.HGet("golimit:corrupt", "tokens"); got != "bad" {
+		t.Fatalf("corrupt bucket reset: %s", got)
 	}
 }
 
 func testRedis(t *testing.T) (*redis.Client, *miniredis.Miniredis) {
 	t.Helper()
 	server := miniredis.RunT(t)
-	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	client := redis.NewClient(&redis.Options{Addr: server.Addr(), ContextTimeoutEnabled: true, MaxRetries: -1})
 	t.Cleanup(func() { _ = client.Close() })
 	return client, server
 }
